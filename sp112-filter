@@ -1,0 +1,194 @@
+#!/usr/bin/env python3
+"""
+Ricoh SP 112 (DDST / GDI) printer filter for Linux.
+
+Protocol reverse engineered from the official Windows driver
+(RXEG1IO.dll / RXEG1IIME.dll, v1.0.1.1):
+
+  job:   ESC%-12345X@PJL / TIMESTAMP / FILENAME / COMPRESS=JBIG /
+         USERNAME / COVER=OFF / HOLD=OFF
+  page:  PAGESTATUS=START / COPIES / QTY / MEDIASOURCE / MEDIATYPE /
+         PAPER / PAPERWIDTH / PAPERLENGTH / RESOLUTION /
+         { IMAGELEN=n + n bytes of JBIG } per chunk / DOTCOUNT /
+         PAGESTATUS=END
+  end:   EOJ / ESC%-12345X
+
+JBIG (T.82) BIE as written by the driver: DL=0 D=0 P=1, XD/YD = full paper
+size in pixels, L0=128, MX=0, ORDER=0x03, OPTIONS=0x48 (LRLTWO|TPBON).
+The driver splits the BIE into chunks of 65536 bytes (the first one also
+carries the 20-byte BIH, so it is 65556), each preceded by its own IMAGELEN.
+
+Usage:
+  as a CUPS filter:  sp112-filter job user title copies options [file]
+  standalone:        sp112-filter --paper A4 file.pdf > /dev/usb/lp0
+"""
+import datetime
+import os
+import re
+import subprocess
+import sys
+
+DPI = 600
+FIRST_CHUNK = 0x10014
+CHUNK = 0x10000
+
+# PJL name, width px, height px at 600 dpi (driver: paper size in mils * dpi / 1000)
+PAPERS = {
+    "A4":        ("A4",        4960, 7016),
+    "Letter":    ("LETTER",    5100, 6600),
+    "Legal":     ("LEGAL",     5100, 8400),
+    "A5":        ("A5",        3496, 4960),
+    "A6":        ("A6",        2480, 3496),
+    "B5":        ("JISB5",     4298, 6070),
+    "Executive": ("EXECUTIVE", 4350, 6300),
+}
+MEDIATYPES = {"PlainAndRecycle": "PLAINRECYCLE", "Plain": "PAPER", "Thin": "THIN",
+              "Thick1": "THICK1", "Thick2": "THICK2", "Recycle": "RECYCLE",
+              "Envelope": "ENVELOPE", "Transparency": "TRANSPARENCY",
+              "Cardstock": "CARDSTOCK"}
+SOURCES = {"Auto": "AUTO", "Tray1": "TRAY1", "Manual": "MANUALFEED"}
+
+
+def log(msg):
+    sys.stderr.write(msg + "\n")
+    sys.stderr.flush()
+
+
+def pjl_safe(s):
+    return re.sub(r'[^\x20-\x7e]', '_', s).replace('"', "'")[:80] or "document"
+
+
+def parse_cups_options(s):
+    opts = {}
+    for tok in s.split():
+        k, _, v = tok.partition("=")
+        opts[k] = v if v else "true"
+    return opts
+
+
+def render_pages(src, w, h, xdpi):
+    """Rasterise PDF/PostScript with Ghostscript; yield raw P4 page bitmaps."""
+    gs = subprocess.Popen(
+        ["gs", "-q", "-dSAFER", "-dBATCH", "-dNOPAUSE", "-sDEVICE=pbmraw",
+         f"-r{xdpi}x{DPI}", f"-g{w}x{h}", "-dFIXEDMEDIA", "-dPDFFitPage",
+         "-dInterpolateControl=0", "-sOutputFile=-", src],
+        stdout=subprocess.PIPE)
+    f = gs.stdout
+    while True:
+        magic = f.read(2)
+        if not magic:
+            break
+        if magic != b"P4":
+            raise RuntimeError("unexpected Ghostscript output")
+        fields = []
+        while len(fields) < 2:
+            tok = b""
+            c = f.read(1)
+            while c.isspace():
+                c = f.read(1)
+            while c == b"#":
+                f.readline()
+                c = f.read(1)
+                while c.isspace():
+                    c = f.read(1)
+            while c and not c.isspace():
+                tok += c
+                c = f.read(1)
+            fields.append(int(tok))
+        pw, ph = fields
+        data = f.read(((pw + 7) // 8) * ph)
+        yield pw, ph, data
+    if gs.wait() != 0:
+        raise RuntimeError(f"Ghostscript failed ({gs.returncode})")
+
+
+def jbig_encode(pw, ph, data):
+    pbm = b"P4\n%d %d\n" % (pw, ph) + data
+    out = subprocess.run(
+        ["pbmtojbg", "-q", "-p", "72", "-o", "3", "-m", "0", "-s", "128"],
+        input=pbm, stdout=subprocess.PIPE, check=True).stdout
+    if len(out) < 20 or out[18] != 0x03 or out[19] != 0x48:
+        raise RuntimeError("pbmtojbg produced an unexpected BIH")
+    return out
+
+
+def write_job(out, src, user, title, paper, mediatype, source, xdpi=DPI):
+    """xdpi is 600 or 1200; vertical resolution is always 600."""
+    pjl_paper, w, h = PAPERS[paper]
+    w = w * xdpi // DPI
+    now = datetime.datetime.now()
+    w_ = lambda s: out.write(s.encode("ascii") + b"\r\n")
+
+    out.write(b"\x1b%-12345X@PJL\r\n")
+    w_(now.strftime("@PJL SET TIMESTAMP=%Y/%m/%d %H:%M:%S"))
+    w_(f"@PJL SET FILENAME={pjl_safe(title)}")
+    w_("@PJL SET COMPRESS=JBIG")
+    w_(f"@PJL SET USERNAME={pjl_safe(user)}")
+    w_("@PJL SET COVER=OFF")
+    w_("@PJL SET HOLD=OFF")
+
+    pages = 0
+    for pw, ph, data in render_pages(src, w, h, xdpi):
+        bie = jbig_encode(pw, ph, data)
+        dots = int.from_bytes(data, "big").bit_count()
+        w_("@PJL SET PAGESTATUS=START")
+        w_("@PJL SET COPIES=1")
+        w_(f"@PJL SET MEDIASOURCE={source}")
+        w_(f"@PJL SET MEDIATYPE={mediatype}")
+        w_(f"@PJL SET PAPER={pjl_paper}")
+        w_(f"@PJL SET PAPERWIDTH={pw}")
+        w_(f"@PJL SET PAPERLENGTH={ph}")
+        w_(f"@PJL SET RESOLUTION={xdpi}")
+        pos, size = 0, FIRST_CHUNK
+        while pos < len(bie):
+            chunk = bie[pos:pos + size]
+            w_(f"@PJL SET IMAGELEN={len(chunk)}")
+            out.write(chunk)
+            pos += len(chunk)
+            size = CHUNK
+        w_(f"@PJL SET DOTCOUNT={dots}")
+        w_("@PJL SET PAGESTATUS=END")
+        out.flush()
+        pages += 1
+        log(f"PAGE: {pages} 1")
+
+    w_("@PJL EOJ")
+    out.write(b"\x1b%-12345X\r\n")
+    out.flush()
+    return pages
+
+
+def main(argv):
+    out = sys.stdout.buffer
+    if not (len(argv) in (6, 7) and argv[1].isdigit()):
+        # standalone mode
+        import argparse
+        ap = argparse.ArgumentParser(description="Ricoh SP 112 standalone driver")
+        ap.add_argument("file")
+        ap.add_argument("--paper", default="A4", choices=sorted(PAPERS))
+        ap.add_argument("--media", default="PlainAndRecycle", choices=sorted(MEDIATYPES))
+        ap.add_argument("--source", default="Auto", choices=sorted(SOURCES))
+        ap.add_argument("--resolution", type=int, default=600, choices=[600, 1200])
+        a = ap.parse_args(argv[1:])
+        write_job(out, a.file, os.environ.get("USER", "user"), os.path.basename(a.file),
+                  a.paper, MEDIATYPES[a.media], SOURCES[a.source], a.resolution)
+        return 0
+
+    _, _job, user, title, _copies, options = argv[:6]
+    src = argv[6] if len(argv) == 7 else "-"
+    opts = parse_cups_options(options)
+    paper = opts.get("PageSize", opts.get("media", "A4"))
+    paper = {k.lower(): k for k in PAPERS}.get(paper.lower(), "A4")
+    mediatype = MEDIATYPES.get(opts.get("MediaType", "PlainAndRecycle"), "PLAINRECYCLE")
+    source = SOURCES.get(opts.get("InputSlot", "Auto"), "AUTO")
+    xdpi = 1200 if opts.get("Resolution", "").startswith("1200") else DPI
+    try:
+        write_job(out, src, user, title, paper, mediatype, source, xdpi)
+    except Exception as e:  # noqa: BLE001 - report to CUPS log
+        log(f"ERROR: {e}")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
